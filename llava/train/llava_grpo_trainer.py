@@ -578,6 +578,119 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
         self.log(metrics)
         return metrics
 
+    def get_mm_adapter_state_maybe_zero_3(self, named_params, keys_to_match):
+        """
+        Get state dict for mm adapter, handling ZeRO-3 case.
+        """
+        to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
+        to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+        return to_return
+
+    def get_peft_state_maybe_zero_3(self, named_params, bias):
+        """
+        Get state dict for PEFT model, handling ZeRO-3 case.
+        """
+        to_return = {k: t for k, t in named_params if "lora_" in k}
+        if bias == "none":
+            to_return = {k: t for k, t in to_return.items() if "bias" not in k}
+        elif bias == "all":
+            to_return = {k: t for k, t in to_return.items() if "bias" in k}
+        elif bias == "lora_only":
+            to_return = {}
+            for k, t in named_params:
+                if "lora_" in k:
+                    to_return[k] = t
+                elif "bias" in k:
+                    to_return[k] = t
+        to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+        return to_return
+
+    def get_peft_state_non_lora_maybe_zero_3(self, named_params):
+        """
+        Get state dict for non-LoRA parameters, handling ZeRO-3 case.
+        """
+        to_return = {k: t for k, t in named_params if "lora_" not in k}
+        to_return = {k: maybe_zero_3(v, ignore_status=True, name=k).cpu() for k, v in to_return.items()}
+        return to_return
+
+    def maybe_zero_3(self, param, ignore_status=False, name=None):
+        """
+        Handle ZeRO-3 parameter state.
+        """
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+        if hasattr(param, "ds_id"):
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                if not ignore_status:
+                    print(name, "no ignore status")
+            with zero.GatheredParameters([param]):
+                param = param.data.detach().cpu().clone()
+        else:
+            param = param.detach().cpu().clone()
+        return param
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """
+        Override _save_checkpoint to handle special cases for GRPO training.
+        """
+        if getattr(self.args, "tune_mm_mlp_adapter", False) or (
+            hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and 
+            ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts))
+        ):
+            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            # Only save Adapter
+            keys_to_match = ["mm_projector", "vision_resampler"]
+            if getattr(self.args, "use_im_start_end", False):
+                keys_to_match.extend(["embed_tokens", "embed_in"])
+
+            weight_to_save = self.get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+
+            if self.args.local_rank == 0 or self.args.local_rank == -1:
+                self.model.config.save_pretrained(output_dir)
+                torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
+        else:
+            # Check if LoRA is enabled
+            lora_enabled = getattr(self.args, "lora_enable", False)
+            if lora_enabled:
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+                checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                run_dir = self._get_output_dir(trial=trial)
+                output_dir = os.path.join(run_dir, checkpoint_folder)
+                from transformers.modeling_utils import unwrap_model
+
+                unwrapped_model = unwrap_model(model)
+                self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
+            else:
+                # Save full model state
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+                checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+                run_dir = self._get_output_dir(trial=trial)
+                output_dir = os.path.join(run_dir, checkpoint_folder)
+
+                if self.args.local_rank == 0 or self.args.local_rank == -1:
+                    # Save model config
+                    self.model.config.save_pretrained(output_dir)
+                    
+                    # Save model weights using save_pretrained
+                    self.model.save_pretrained(output_dir)
+                    
+                    # Save generation config if available
+                    if hasattr(self.model, "generation_config"):
+                        self.model.generation_config.save_pretrained(output_dir)
+                    
+                    # Save tokenizer
+                    if hasattr(self, "tokenizer"):
+                        self.tokenizer.save_pretrained(output_dir)
+                    
+                    # Save training args
+                    torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
     def save_model(self, output_dir=None, _internal_call=False):
         """
         Override save_model method to handle ZeRO-3 model saving and ensure all paths are valid.
@@ -620,7 +733,7 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(["embed_tokens", "embed_in"])
 
-            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            weight_to_save = self.get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
             self.model.config.save_pretrained(valid_output_dir)
 
             current_folder = valid_output_dir.split("/")[-1]
@@ -635,14 +748,27 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
             return valid_output_dir
 
         if self.deepspeed:
-            # 使用self而不是trainer来调用父类的save_model方法
+            # Use self instead of trainer to call parent class's save_model method
             super().save_model(valid_output_dir)
             return valid_output_dir
 
-        state_dict = self.model.state_dict()
-        if self.args.should_save:
-            cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-            del state_dict
-            self._save(valid_output_dir, state_dict=cpu_state_dict)  # noqa
+        # Save full model state
+        if self.args.local_rank == 0 or self.args.local_rank == -1:
+            # Save model config
+            self.model.config.save_pretrained(valid_output_dir)
+            
+            # Save model weights using save_pretrained
+            self.model.save_pretrained(valid_output_dir)
+            
+            # Save generation config if available
+            if hasattr(self.model, "generation_config"):
+                self.model.generation_config.save_pretrained(valid_output_dir)
+            
+            # Save tokenizer
+            if hasattr(self, "tokenizer"):
+                self.tokenizer.save_pretrained(valid_output_dir)
+            
+            # Save training args
+            torch.save(self.args, os.path.join(valid_output_dir, "training_args.bin"))
 
         return valid_output_dir
