@@ -578,216 +578,71 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
         self.log(metrics)
         return metrics
 
-    def _save_checkpoint(self, model, trial, metrics=None):
-        """保存检查点，确保路径有效并处理LLaVA特定的组件。"""
-        import tempfile
-        from datetime import datetime
-        
-        # 第一步：尝试调用父类的_save_checkpoint方法
-        try:
-            checkpoint_folder = super()._save_checkpoint(model, trial, metrics)
-        except Exception as e:
-            rank0_print(f"父类_save_checkpoint调用失败: {e}")
-            checkpoint_folder = None
-        
-        # 第二步：确保有一个有效的checkpoint_folder
-        if checkpoint_folder is None:
-            rank0_print("父类返回的checkpoint_folder为None，创建替代路径")
-            # 尝试从训练参数中获取输出目录
-            base_output_dir = None
-            if hasattr(self, "args") and hasattr(self.args, "output_dir"):
-                base_output_dir = self.args.output_dir
-            
-            # 如果有base_output_dir，使用它创建检查点目录
-            if base_output_dir:
-                # 使用时间戳创建唯一的检查点目录
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                checkpoint_folder = os.path.join(base_output_dir, f"checkpoint-{timestamp}")
-                try:
-                    os.makedirs(checkpoint_folder, exist_ok=True)
-                    rank0_print(f"创建检查点目录: {checkpoint_folder}")
-                except Exception as e:
-                    rank0_print(f"无法创建检查点目录: {e}")
-                    checkpoint_folder = None
-            
-            # 如果仍然没有有效的检查点目录，创建临时目录
-            if checkpoint_folder is None:
-                checkpoint_folder = tempfile.mkdtemp(prefix="llava_checkpoint_")
-                rank0_print(f"使用临时检查点目录: {checkpoint_folder}")
-        else:
-            rank0_print(f"使用父类返回的检查点目录: {checkpoint_folder}")
-        
-        # 第三步：确保检查点目录存在
-        try:
-            os.makedirs(checkpoint_folder, exist_ok=True)
-        except Exception as e:
-            rank0_print(f"确保检查点目录存在时出错: {e}")
-            # 创建一个新的临时目录作为后备
-            checkpoint_folder = tempfile.mkdtemp(prefix="llava_backup_checkpoint_")
-            rank0_print(f"使用备用临时检查点目录: {checkpoint_folder}")
-            os.makedirs(checkpoint_folder, exist_ok=True)
-        
-        # 第四步：处理DeepSpeed ZeRO-3配置
-        try:
-            is_zero3 = False
-            ds_config = {}
-            
-            # 检查是否使用DeepSpeed
-            if hasattr(self, "is_deepspeed_enabled") and self.is_deepspeed_enabled:
-                if hasattr(self, "args") and hasattr(self.args, "deepspeed"):
-                    # 获取deepspeed配置
-                    if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
-                        import json
-                        with open(self.args.deepspeed, 'r') as f:
-                            ds_config = json.load(f)
-                    elif isinstance(self.args.deepspeed, dict):
-                        ds_config = self.args.deepspeed
-                    
-                    # 检查是否为ZeRO-3
-                    if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
-                        is_zero3 = True
-                        # 检查是否设置了不自动合并权重
-                        if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
-                            rank0_print("\n" + "*" * 80)
-                            rank0_print("注意: 由于DeepSpeed ZeRO-3配置设置了stage3_gather_16bit_weights_on_model_save=false")
-                            rank0_print("检查点已经保存为分片格式，您需要使用zero_to_fp32.py来恢复完整模型。")
-                            # 安全地构建命令路径
-                            full_model_path = os.path.join(checkpoint_folder, "full_model.bin")
-                            rank0_print("运行以下命令转换模型:")
-                            rank0_print(f"python -m deepspeed.utils.zero_to_fp32.py {checkpoint_folder} {full_model_path}")
-                            rank0_print("*" * 80 + "\n")
-        except Exception as e:
-            rank0_print(f"处理DeepSpeed配置时出错: {e}")
-        
-        # 第五步：保存vision tower（如果存在）
-        try:
-            unwrapped_model = model
-            if hasattr(self, "accelerator") and self.accelerator:
-                unwrapped_model = self.accelerator.unwrap_model(model)
-                
-            # 检查模型是否有get_vision_tower方法
-            if hasattr(unwrapped_model, "get_vision_tower"):
-                vision_tower = unwrapped_model.get_vision_tower()
-                if vision_tower is not None:
-                    # 创建vision tower保存路径
-                    vision_tower_path = os.path.join(checkpoint_folder, "vision_tower")
-                    os.makedirs(vision_tower_path, exist_ok=True)
-                    
-                    # 尝试保存vision tower
-                    if hasattr(vision_tower, "save_pretrained"):
-                        rank0_print(f"使用save_pretrained保存检查点vision tower到: {vision_tower_path}")
-                        vision_tower.save_pretrained(vision_tower_path)
-                    elif hasattr(vision_tower, "save_model"):
-                        rank0_print(f"使用save_model保存检查点vision tower到: {vision_tower_path}")
-                        vision_tower.save_model(vision_tower_path)
-                    else:
-                        # 如果没有标准保存方法，使用state_dict
-                        rank0_print(f"使用state_dict保存检查点vision tower到: {vision_tower_path}")
-                        torch.save(vision_tower.state_dict(), os.path.join(vision_tower_path, "pytorch_model.bin"))
-        except Exception as e:
-            rank0_print(f"保存vision tower时出错: {e}")
-        
-        # 返回有效的检查点目录
-        return checkpoint_folder
-
     def save_model(self, output_dir=None, _internal_call=False):
         """
-        重写保存模型方法，添加对ZeRO-3保存模型的处理，并确保所有路径有效。
+        Override save_model method to handle ZeRO-3 model saving and ensure all paths are valid.
         """
-        # 第一步：确保有一个有效的output_dir
+        # Step 1: Ensure we have a valid output_dir
         valid_output_dir = None
         
-        # 尝试使用传入的output_dir
+        # Try to use provided output_dir
         if output_dir is not None:
             valid_output_dir = output_dir
-            rank0_print(f"使用传入的output_dir: {valid_output_dir}")
-        # 尝试从args中获取output_dir
+        # Try to get output_dir from args
         elif hasattr(self, "args") and hasattr(self.args, "output_dir") and self.args.output_dir:
             valid_output_dir = self.args.output_dir
-            rank0_print(f"使用训练参数中的output_dir: {valid_output_dir}")
-        # 创建临时目录作为最后手段
+        # Create temporary directory as last resort
         else:
             valid_output_dir = tempfile.mkdtemp(prefix="llava_model_")
-            rank0_print(f"创建临时输出目录: {valid_output_dir}")
         
-        # 确保输出目录存在
+        # Ensure output directory exists
         try:
             os.makedirs(valid_output_dir, exist_ok=True)
         except Exception as e:
-            rank0_print(f"创建目录失败: {e}，使用临时目录")
             valid_output_dir = tempfile.mkdtemp(prefix="llava_model_")
-            rank0_print(f"创建临时输出目录: {valid_output_dir}")
             os.makedirs(valid_output_dir, exist_ok=True)
-        
-        # 第二步：调用父类的save_model方法
-        try:
-            # 使用我们确认有效的输出目录
-            super_output_dir = super().save_model(valid_output_dir, _internal_call)
-            
-            # 如果父类返回了有效路径，使用它
-            if super_output_dir is not None:
-                valid_output_dir = super_output_dir
-                rank0_print(f"父类返回的有效输出目录: {valid_output_dir}")
-        except Exception as e:
-            rank0_print(f"父类save_model调用失败: {e}")
-            # 继续使用我们的有效目录
-        
-        # 第三步：处理DeepSpeed ZeRO-3相关逻辑
-        try:
-            is_zero3 = False
-            ds_config = {}
-            
-            # 检查是否使用DeepSpeed
-            if hasattr(self, "is_deepspeed_enabled") and self.is_deepspeed_enabled and hasattr(self, "args") and hasattr(self.args, "deepspeed") and self.args.deepspeed:
-                # 获取deepspeed配置
-                if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
-                    import json
-                    with open(self.args.deepspeed, 'r') as f:
-                        ds_config = json.load(f)
-                elif isinstance(self.args.deepspeed, dict):
-                    ds_config = self.args.deepspeed
-                
-                # 检查是否为ZeRO-3
-                if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
-                    is_zero3 = True
-                    # 检查是否设置了不自动合并权重
-                    if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
-                        rank0_print("\n" + "=" * 80)
-                        rank0_print("训练已完成，最终模型已保存。由于使用了DeepSpeed ZeRO-3分片保存:")
-                        rank0_print(f"1. 模型已保存到: {valid_output_dir}")
-                        # 安全地构建命令路径
-                        full_model_path = os.path.join(valid_output_dir, "full_model.bin")
-                        rank0_print("2. 如需恢复完整模型，请使用以下命令:")
-                        rank0_print(f"   python -m deepspeed.utils.zero_to_fp32.py {valid_output_dir} {full_model_path}")
-                        rank0_print("=" * 80 + "\n")
-        except Exception as e:
-            rank0_print(f"处理DeepSpeed配置时出错: {e}")
-        
-        # 第四步：保存vision tower（如果存在）
-        try:
-            if hasattr(self, "model") and self.model:
-                unwrapped_model = self.model
-                if hasattr(self, "accelerator") and hasattr(self.accelerator, "unwrap_model"):
-                    unwrapped_model = self.accelerator.unwrap_model(self.model)
-                
-                if hasattr(unwrapped_model, "get_vision_tower"):
-                    vision_tower = unwrapped_model.get_vision_tower()
-                    if vision_tower is not None:
-                        vision_tower_path = os.path.join(valid_output_dir, "vision_tower")
-                        os.makedirs(vision_tower_path, exist_ok=True)
-                        
-                        # 尝试保存vision tower
-                        if hasattr(vision_tower, "save_pretrained"):
-                            rank0_print(f"使用save_pretrained保存vision tower到: {vision_tower_path}")
-                            vision_tower.save_pretrained(vision_tower_path)
-                        elif hasattr(vision_tower, "save_model"):
-                            rank0_print(f"使用save_model保存vision tower到: {vision_tower_path}")
-                            vision_tower.save_model(vision_tower_path)
-                        else:
-                            rank0_print(f"使用state_dict保存vision tower到: {vision_tower_path}")
-                            torch.save(vision_tower.state_dict(), os.path.join(vision_tower_path, "pytorch_model.bin"))
-        except Exception as e:
-            rank0_print(f"保存vision tower时出错: {e}")
-        
-        # 返回有效的输出目录
-        return valid_output_dir 
+
+        # Check if we should only save mm adapter
+        check_only_save_mm_adapter_tunnable = False
+        if hasattr(self.args, "tune_mm_mlp_adapter") and self.args.tune_mm_mlp_adapter:
+            check_only_save_mm_adapter_tunnable = True
+        elif hasattr(self.args, "mm_tunable_parts") and (len(self.args.mm_tunable_parts.split(",")) == 1 and 
+              ("mm_mlp_adapter" in self.args.mm_tunable_parts or "mm_vision_resampler" in self.args.mm_tunable_parts)):
+            check_only_save_mm_adapter_tunnable = True
+
+        self.accelerator.wait_for_everyone()
+        torch.cuda.synchronize()
+        rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
+
+        if check_only_save_mm_adapter_tunnable:
+            # Only save Adapter
+            keys_to_match = ["mm_projector", "vision_resampler"]
+            if getattr(self.args, "use_im_start_end", False):
+                keys_to_match.extend(["embed_tokens", "embed_in"])
+
+            weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+            self.model.config.save_pretrained(valid_output_dir)
+
+            current_folder = valid_output_dir.split("/")[-1]
+            parent_folder = os.path.dirname(valid_output_dir)
+            if self.args.local_rank == 0 or self.args.local_rank == -1:
+                if current_folder.startswith("checkpoint-"):
+                    mm_projector_folder = os.path.join(parent_folder, "mm_projector")
+                    os.makedirs(mm_projector_folder, exist_ok=True)
+                    torch.save(weight_to_save, os.path.join(mm_projector_folder, f"{current_folder}.bin"))
+                else:
+                    torch.save(weight_to_save, os.path.join(valid_output_dir, f"mm_projector.bin"))
+            return valid_output_dir
+
+        if self.deepspeed:
+            # 使用self而不是trainer来调用父类的save_model方法
+            super().save_model(valid_output_dir)
+            return valid_output_dir
+
+        state_dict = self.model.state_dict()
+        if self.args.should_save:
+            cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+            del state_dict
+            self._save(valid_output_dir, state_dict=cpu_state_dict)  # noqa
+
+        return valid_output_dir
