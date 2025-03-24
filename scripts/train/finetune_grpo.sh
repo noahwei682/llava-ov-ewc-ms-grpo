@@ -8,10 +8,10 @@ export NPROC_PER_NODE=4
 export NODES=1 
 export NODE_RANK=0 
 
-# Run name and output directory
-export RUN_NAME="llava-onevision-grpo-flower-classification"
-export OUTPUT_DIR="./outputs/grpo_flower_classification"
-export PREV_STAGE_CHECKPOINT="lmms-lab/llava-onevision-qwen2-7b-si" # replace with your model checkpoint
+# # Run name and output directory
+# export RUN_NAME="llava-onevision-grpo-flower-classification"
+# export OUTPUT_DIR="./outputs/grpo_flower_classification"
+# export PREV_STAGE_CHECKPOINT="lmms-lab/llava-onevision-qwen2-7b-si" # replace with your model checkpoint
 export VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 # Clean model name for logging
@@ -54,9 +54,9 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node $NPROC_PER_NODE --nnodes $NO
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 2 \
     --evaluation_strategy "steps" \
-    --eval_steps 100 \
+    --eval_steps 5 \
     --save_strategy "steps" \
-    --save_steps 300 \
+    --save_steps 10 \
     --save_total_limit 1 \
     --learning_rate 5e-6 \
     --weight_decay 0. \
