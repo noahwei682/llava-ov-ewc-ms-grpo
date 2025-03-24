@@ -91,6 +91,14 @@ class GRPOConfig(TrainingArguments):
     group_by_modality_length: bool = field(default=False, metadata={"help": "Group training data by modality length for batch creation"})
     group_by_modality_length_auto: bool = field(default=False, metadata={"help": "Automatically group training data by modality length"})
     auto_find_batch_size: bool = field(default=False, metadata={"help": "Automatically find optimal batch size"})
+    # LoRA related parameters
+    lora_enable: bool = field(default=False, metadata={"help": "Whether to use LoRA"})
+    lora_r: int = field(default=8, metadata={"help": "LoRA attention dimension"})
+    lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling"})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
+    lora_bias: str = field(default="none", metadata={"help": "LoRA bias type"})
+    lora_target_modules: Optional[str] = field(default=None, metadata={"help": "LoRA target modules"})
+    lora_modules_to_save: Optional[str] = field(default=None, metadata={"help": "LoRA modules to save"})
     # Add other GRPO-specific parameters as needed
 
 
@@ -582,16 +590,21 @@ def main():
             if hasattr(trainer, "accelerator") and hasattr(trainer.accelerator, "unwrap_model"):
                 unwrapped_model = trainer.accelerator.unwrap_model(trainer.model)
 
-            # Save model weights
-            from safetensors.torch import save_file
-            state_dict = unwrapped_model.state_dict()
-            save_file(state_dict, os.path.join(training_args.output_dir, "model.safetensors"))
+            # Save model weights and configs
+            if training_args.lora_enable:
+                state_dict = get_peft_state_maybe_zero_3(unwrapped_model.named_parameters(), training_args.lora_bias)
+                non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(unwrapped_model.named_parameters())
+                if training_args.local_rank == 0 or training_args.local_rank == -1:
+                    if hasattr(unwrapped_model, "config"):
+                        unwrapped_model.config.save_pretrained(training_args.output_dir)
+                    if hasattr(unwrapped_model, "generation_config"):
+                        unwrapped_model.generation_config.save_pretrained(training_args.output_dir)
+                    unwrapped_model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+                    torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
+            else:
+                safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
-            # Save config if available
-            if hasattr(unwrapped_model, "config"):
-                config_path = os.path.join(training_args.output_dir, "config.json")
-                with open(config_path, "w") as f:
-                    json.dump(unwrapped_model.config.to_dict(), f, indent=2)
+            rank0_print(f"Model saved to {training_args.output_dir}")
     except Exception as e:
         rank0_print(f"Error saving model weights: {e}")
 
