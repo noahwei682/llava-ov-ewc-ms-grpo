@@ -8,10 +8,10 @@ export NPROC_PER_NODE=4
 export NODES=1 
 export NODE_RANK=0 
 
-# Run name and output directory
-export RUN_NAME="llava-onevision-grpo-flower-classification"
-export OUTPUT_DIR="./outputs/grpo_flower_classification"
-export PREV_STAGE_CHECKPOINT="lmms-lab/llava-onevision-qwen2-7b-si" # replace with your model checkpoint
+# # Run name and output directory
+# export RUN_NAME="llava-onevision-grpo-flower-classification"
+# export OUTPUT_DIR="./outputs/grpo_flower_classification"
+# export PREV_STAGE_CHECKPOINT="lmms-lab/llava-onevision-qwen2-7b-si" # replace with your model checkpoint
 export VISION_MODEL_VERSION="google/siglip-so400m-patch14-384"
 
 # Clean model name for logging
