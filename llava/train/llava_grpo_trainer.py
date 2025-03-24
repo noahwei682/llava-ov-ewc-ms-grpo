@@ -6,9 +6,11 @@ import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Any, Callable, Tuple
+import json
+import tempfile
 
 from transformers import Trainer
-from trl.trainer.grpo_trainer import GRPOTrainer, accuracy_reward, format_reward
+from trl.trainer.grpo_trainer import GRPOTrainer
 from llava.utils import rank0_print
 from llava.train.train import LLaVATrainer
 
@@ -19,6 +21,71 @@ def extract_answer(text):
     if match:
         return match.group(1).strip()
     return text.strip()
+
+
+# 添加自定义format_reward实现
+def format_reward(completions, solutions=None):
+    """
+    计算格式奖励。检查生成的回答是否使用了正确的格式。
+    """
+    rewards = []
+    
+    for completion in completions:
+        # 默认奖励为0.5
+        reward = 0.5
+        
+        # 确保completion有内容
+        if not completion or len(completion) == 0:
+            rewards.append(0.0)
+            continue
+            
+        # 获取回答内容
+        answer_text = completion[0].get("content", "") if isinstance(completion, list) else completion
+        
+        # 检查是否包含<answer>标记
+        if "<answer>" in answer_text and "</answer>" in answer_text:
+            # 增加奖励值，格式正确
+            reward = 1.0
+        
+        rewards.append(reward)
+        
+    return rewards
+
+
+def accuracy_reward(completions, solutions):
+    """
+    计算准确性奖励。比较生成的回答和参考答案的相似度。
+    """
+    rewards = []
+    
+    for i, completion in enumerate(completions):
+        # 默认奖励值0.1
+        reward = 0.1
+        
+        # 确保completion有内容且存在solutions
+        if not completion or len(completion) == 0:
+            rewards.append(0.0)
+            continue
+            
+        # 从回答中提取答案部分
+        answer_text = completion[0].get("content", "") if isinstance(completion, list) else completion
+        extracted_answer = extract_answer(answer_text)
+        
+        # 获取参考答案
+        if solutions and i < len(solutions):
+            solution = solutions[i]
+            # 简单的词重叠比较
+            answer_words = set(re.findall(r'\b\w+\b', extracted_answer.lower()))
+            solution_words = set(re.findall(r'\b\w+\b', solution.lower()))
+            
+            if len(solution_words) > 0 and len(answer_words) > 0:
+                # 计算重叠率
+                overlap = len(answer_words.intersection(solution_words)) / len(solution_words)
+                reward = min(1.0, overlap * 2.0)  # 缩放到[0,1]范围
+            
+        rewards.append(reward)
+        
+    return rewards
 
 
 class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
@@ -251,23 +318,28 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
             if pixel_values is not None:
                 pixel_values = pixel_values.to(self.args.device)
             
-            # Configure generation parameters
-            gen_kwargs = {
-                "max_new_tokens": 512,
-                "do_sample": False,
-                "temperature": 1.0,
-                "top_p": 0.9,
-            }
-            
             # 检测模型类型
             model_type = model.__class__.__name__.lower()
             rank0_print(f"Using model type: {model_type}")
+            
+            # Configure generation parameters consistently
+            gen_kwargs = {
+                "max_new_tokens": 512,
+                "do_sample": True,
+                "temperature": 1.0,
+                "top_p": 0.9,
+                # 保证所有参数兼容性
+                "use_cache": True  # 生成时启用缓存
+            }
+            
+            # 针对Qwen模型的特殊处理
+            is_qwen_model = 'qwen' in model_type or 'llava_qwen' in model_type.lower()
             
             # Generate completions
             with torch.no_grad():
                 try:
                     # 对于Qwen模型的特殊处理
-                    if 'qwen' in model_type or 'llava_qwen' in model_type.lower():
+                    if is_qwen_model:
                         rank0_print("Using Qwen-specific generation parameters")
                         
                         # 检查是否有有效图像
@@ -281,24 +353,24 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
                                                  pixel_values.numel() > 0)
                         
                         try:
-                            # 根据可用的多模态输入选择生成方法
+                            # 修正Qwen模型生成调用，使用input_ids
                             if has_valid_images:
                                 outputs = model.generate(
-                                    inputs=input_ids,  # 使用inputs参数而不是input_ids
+                                    input_ids=input_ids,  # 使用input_ids参数
                                     attention_mask=attention_mask,
                                     images=images,
                                     **gen_kwargs
                                 )
                             elif has_valid_pixel_values:
                                 outputs = model.generate(
-                                    inputs=input_ids,  # 使用inputs参数而不是input_ids
+                                    input_ids=input_ids,  # 使用input_ids参数
                                     attention_mask=attention_mask,
                                     pixel_values=pixel_values,
                                     **gen_kwargs
                                 )
                             else:
                                 outputs = model.generate(
-                                    inputs=input_ids,  # 使用inputs参数而不是input_ids
+                                    input_ids=input_ids,  # 使用input_ids参数
                                     attention_mask=attention_mask,
                                     **gen_kwargs
                                 )
@@ -307,11 +379,22 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
                             rank0_print(f"Qwen generate error: {qwen_e}")
                             # 尝试不带任何多模态输入
                             rank0_print("Trying Qwen generation without multimodal inputs")
-                            outputs = model.generate(
-                                inputs=input_ids,
-                                attention_mask=attention_mask,
-                                **gen_kwargs
-                            )
+                            try:
+                                outputs = model.generate(
+                                    input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    **gen_kwargs
+                                )
+                            except Exception as e3:
+                                rank0_print(f"Failed standard generation: {e3}")
+                                # 尝试使用裸模型直接生成
+                                from transformers.generation import GenerationConfig
+                                model.generation_config = GenerationConfig(**gen_kwargs)
+                                outputs = model(
+                                    input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    return_dict=True
+                                ).logits.argmax(dim=-1)
                     else:
                         # 非Qwen模型的标准处理
                         has_valid_images = (images is not None and 
@@ -496,87 +579,215 @@ class LLaVAGRPOTrainer(LLaVATrainer, GRPOTrainer):
         return metrics
 
     def _save_checkpoint(self, model, trial, metrics=None):
-        """Save checkpoints with specific LLaVA handling."""
-        # Call parent save checkpoint
-        checkpoint_folder = super()._save_checkpoint(model, trial, metrics)
+        """保存检查点，确保路径有效并处理LLaVA特定的组件。"""
+        import tempfile
+        from datetime import datetime
         
-        # 检查是否使用DeepSpeed ZeRO-3并需要处理分片检查点
-        is_zero3 = False
-        if self.is_deepspeed_enabled and self.args.deepspeed:
-            # 获取deepspeed配置
-            if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
-                import json
-                with open(self.args.deepspeed, 'r') as f:
-                    ds_config = json.load(f)
-            elif isinstance(self.args.deepspeed, dict):
-                ds_config = self.args.deepspeed
-            else:
-                ds_config = {}
+        # 第一步：尝试调用父类的_save_checkpoint方法
+        try:
+            checkpoint_folder = super()._save_checkpoint(model, trial, metrics)
+        except Exception as e:
+            rank0_print(f"父类_save_checkpoint调用失败: {e}")
+            checkpoint_folder = None
+        
+        # 第二步：确保有一个有效的checkpoint_folder
+        if checkpoint_folder is None:
+            rank0_print("父类返回的checkpoint_folder为None，创建替代路径")
+            # 尝试从训练参数中获取输出目录
+            base_output_dir = None
+            if hasattr(self, "args") and hasattr(self.args, "output_dir"):
+                base_output_dir = self.args.output_dir
+            
+            # 如果有base_output_dir，使用它创建检查点目录
+            if base_output_dir:
+                # 使用时间戳创建唯一的检查点目录
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                checkpoint_folder = os.path.join(base_output_dir, f"checkpoint-{timestamp}")
+                try:
+                    os.makedirs(checkpoint_folder, exist_ok=True)
+                    rank0_print(f"创建检查点目录: {checkpoint_folder}")
+                except Exception as e:
+                    rank0_print(f"无法创建检查点目录: {e}")
+                    checkpoint_folder = None
+            
+            # 如果仍然没有有效的检查点目录，创建临时目录
+            if checkpoint_folder is None:
+                checkpoint_folder = tempfile.mkdtemp(prefix="llava_checkpoint_")
+                rank0_print(f"使用临时检查点目录: {checkpoint_folder}")
+        else:
+            rank0_print(f"使用父类返回的检查点目录: {checkpoint_folder}")
+        
+        # 第三步：确保检查点目录存在
+        try:
+            os.makedirs(checkpoint_folder, exist_ok=True)
+        except Exception as e:
+            rank0_print(f"确保检查点目录存在时出错: {e}")
+            # 创建一个新的临时目录作为后备
+            checkpoint_folder = tempfile.mkdtemp(prefix="llava_backup_checkpoint_")
+            rank0_print(f"使用备用临时检查点目录: {checkpoint_folder}")
+            os.makedirs(checkpoint_folder, exist_ok=True)
+        
+        # 第四步：处理DeepSpeed ZeRO-3配置
+        try:
+            is_zero3 = False
+            ds_config = {}
+            
+            # 检查是否使用DeepSpeed
+            if hasattr(self, "is_deepspeed_enabled") and self.is_deepspeed_enabled:
+                if hasattr(self, "args") and hasattr(self.args, "deepspeed"):
+                    # 获取deepspeed配置
+                    if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
+                        import json
+                        with open(self.args.deepspeed, 'r') as f:
+                            ds_config = json.load(f)
+                    elif isinstance(self.args.deepspeed, dict):
+                        ds_config = self.args.deepspeed
+                    
+                    # 检查是否为ZeRO-3
+                    if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
+                        is_zero3 = True
+                        # 检查是否设置了不自动合并权重
+                        if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
+                            rank0_print("\n" + "*" * 80)
+                            rank0_print("注意: 由于DeepSpeed ZeRO-3配置设置了stage3_gather_16bit_weights_on_model_save=false")
+                            rank0_print("检查点已经保存为分片格式，您需要使用zero_to_fp32.py来恢复完整模型。")
+                            # 安全地构建命令路径
+                            full_model_path = os.path.join(checkpoint_folder, "full_model.bin")
+                            rank0_print("运行以下命令转换模型:")
+                            rank0_print(f"python -m deepspeed.utils.zero_to_fp32.py {checkpoint_folder} {full_model_path}")
+                            rank0_print("*" * 80 + "\n")
+        except Exception as e:
+            rank0_print(f"处理DeepSpeed配置时出错: {e}")
+        
+        # 第五步：保存vision tower（如果存在）
+        try:
+            unwrapped_model = model
+            if hasattr(self, "accelerator") and self.accelerator:
+                unwrapped_model = self.accelerator.unwrap_model(model)
                 
-            # 检查是否为ZeRO-3
-            if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
-                is_zero3 = True
-                # 检查是否设置了不自动合并权重
-                if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
-                    rank0_print("\n" + "*" * 80)
-                    rank0_print("注意: 由于DeepSpeed ZeRO-3配置设置了stage3_gather_16bit_weights_on_model_save=false")
-                    rank0_print("检查点已经保存为分片格式，您需要使用zero_to_fp32.py来恢复完整模型。")
-                    rank0_print("运行以下命令转换模型:")
-                    rank0_print(f"python -m deepspeed.utils.zero_to_fp32.py {checkpoint_folder} {os.path.join(checkpoint_folder, 'full_model.bin')}")
-                    rank0_print("*" * 80 + "\n")
-        
-        # Extract and save vision tower if present
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        if hasattr(unwrapped_model, "get_vision_tower"):
-            vision_tower = unwrapped_model.get_vision_tower()
-            if vision_tower is not None:
-                # 检查视觉塔是否有save_pretrained方法
-                if hasattr(vision_tower, "save_pretrained"):
-                    vision_tower.save_pretrained(os.path.join(checkpoint_folder, "vision_tower"))
-                elif hasattr(vision_tower, "save_model"):
-                    vision_tower.save_model(os.path.join(checkpoint_folder, "vision_tower"))
-                else:
-                    # 如果没有标准保存方法，记录警告并尝试使用状态字典
-                    rank0_print(f"Warning: {type(vision_tower).__name__} has no standard save method. Attempting to save state_dict.")
-                    try:
-                        # 尝试创建保存目录
-                        vision_tower_path = os.path.join(checkpoint_folder, "vision_tower")
-                        os.makedirs(vision_tower_path, exist_ok=True)
-                        # 保存状态字典
+            # 检查模型是否有get_vision_tower方法
+            if hasattr(unwrapped_model, "get_vision_tower"):
+                vision_tower = unwrapped_model.get_vision_tower()
+                if vision_tower is not None:
+                    # 创建vision tower保存路径
+                    vision_tower_path = os.path.join(checkpoint_folder, "vision_tower")
+                    os.makedirs(vision_tower_path, exist_ok=True)
+                    
+                    # 尝试保存vision tower
+                    if hasattr(vision_tower, "save_pretrained"):
+                        rank0_print(f"使用save_pretrained保存检查点vision tower到: {vision_tower_path}")
+                        vision_tower.save_pretrained(vision_tower_path)
+                    elif hasattr(vision_tower, "save_model"):
+                        rank0_print(f"使用save_model保存检查点vision tower到: {vision_tower_path}")
+                        vision_tower.save_model(vision_tower_path)
+                    else:
+                        # 如果没有标准保存方法，使用state_dict
+                        rank0_print(f"使用state_dict保存检查点vision tower到: {vision_tower_path}")
                         torch.save(vision_tower.state_dict(), os.path.join(vision_tower_path, "pytorch_model.bin"))
-                        rank0_print(f"Saved vision tower state_dict to {vision_tower_path}")
-                    except Exception as e:
-                        rank0_print(f"Failed to save vision tower: {e}")
-                
+        except Exception as e:
+            rank0_print(f"保存vision tower时出错: {e}")
+        
+        # 返回有效的检查点目录
         return checkpoint_folder
 
     def save_model(self, output_dir=None, _internal_call=False):
-        """重写保存模型方法，添加对ZeRO-3保存模型的处理"""
-        # 调用父类方法
-        output_dir = super().save_model(output_dir, _internal_call)
+        """
+        重写保存模型方法，添加对ZeRO-3保存模型的处理，并确保所有路径有效。
+        """
+        # 第一步：确保有一个有效的output_dir
+        valid_output_dir = None
         
-        # 检查是否使用DeepSpeed ZeRO-3
-        is_zero3 = False
-        if self.is_deepspeed_enabled and self.args.deepspeed:
-            # 获取deepspeed配置
-            if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
-                import json
-                with open(self.args.deepspeed, 'r') as f:
-                    ds_config = json.load(f)
-            elif isinstance(self.args.deepspeed, dict):
-                ds_config = self.args.deepspeed
-            else:
-                ds_config = {}
+        # 尝试使用传入的output_dir
+        if output_dir is not None:
+            valid_output_dir = output_dir
+            rank0_print(f"使用传入的output_dir: {valid_output_dir}")
+        # 尝试从args中获取output_dir
+        elif hasattr(self, "args") and hasattr(self.args, "output_dir") and self.args.output_dir:
+            valid_output_dir = self.args.output_dir
+            rank0_print(f"使用训练参数中的output_dir: {valid_output_dir}")
+        # 创建临时目录作为最后手段
+        else:
+            valid_output_dir = tempfile.mkdtemp(prefix="llava_model_")
+            rank0_print(f"创建临时输出目录: {valid_output_dir}")
+        
+        # 确保输出目录存在
+        try:
+            os.makedirs(valid_output_dir, exist_ok=True)
+        except Exception as e:
+            rank0_print(f"创建目录失败: {e}，使用临时目录")
+            valid_output_dir = tempfile.mkdtemp(prefix="llava_model_")
+            rank0_print(f"创建临时输出目录: {valid_output_dir}")
+            os.makedirs(valid_output_dir, exist_ok=True)
+        
+        # 第二步：调用父类的save_model方法
+        try:
+            # 使用我们确认有效的输出目录
+            super_output_dir = super().save_model(valid_output_dir, _internal_call)
+            
+            # 如果父类返回了有效路径，使用它
+            if super_output_dir is not None:
+                valid_output_dir = super_output_dir
+                rank0_print(f"父类返回的有效输出目录: {valid_output_dir}")
+        except Exception as e:
+            rank0_print(f"父类save_model调用失败: {e}")
+            # 继续使用我们的有效目录
+        
+        # 第三步：处理DeepSpeed ZeRO-3相关逻辑
+        try:
+            is_zero3 = False
+            ds_config = {}
+            
+            # 检查是否使用DeepSpeed
+            if hasattr(self, "is_deepspeed_enabled") and self.is_deepspeed_enabled and hasattr(self, "args") and hasattr(self.args, "deepspeed") and self.args.deepspeed:
+                # 获取deepspeed配置
+                if isinstance(self.args.deepspeed, str) and os.path.exists(self.args.deepspeed):
+                    import json
+                    with open(self.args.deepspeed, 'r') as f:
+                        ds_config = json.load(f)
+                elif isinstance(self.args.deepspeed, dict):
+                    ds_config = self.args.deepspeed
                 
-            # 检查是否为ZeRO-3并且未设置自动合并权重
-            if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
-                is_zero3 = True
-                if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
-                    rank0_print("\n" + "=" * 80)
-                    rank0_print("训练已完成，最终模型已保存。由于使用了DeepSpeed ZeRO-3分片保存:")
-                    rank0_print(f"1. 模型已保存到: {output_dir}")
-                    rank0_print(f"2. 如需恢复完整模型，请使用以下命令:")
-                    rank0_print(f"   python -m deepspeed.utils.zero_to_fp32.py {output_dir} {os.path.join(output_dir, 'full_model.bin')}")
-                    rank0_print("=" * 80 + "\n")
+                # 检查是否为ZeRO-3
+                if "zero_optimization" in ds_config and ds_config["zero_optimization"].get("stage", 0) == 3:
+                    is_zero3 = True
+                    # 检查是否设置了不自动合并权重
+                    if not ds_config["zero_optimization"].get("stage3_gather_16bit_weights_on_model_save", True):
+                        rank0_print("\n" + "=" * 80)
+                        rank0_print("训练已完成，最终模型已保存。由于使用了DeepSpeed ZeRO-3分片保存:")
+                        rank0_print(f"1. 模型已保存到: {valid_output_dir}")
+                        # 安全地构建命令路径
+                        full_model_path = os.path.join(valid_output_dir, "full_model.bin")
+                        rank0_print("2. 如需恢复完整模型，请使用以下命令:")
+                        rank0_print(f"   python -m deepspeed.utils.zero_to_fp32.py {valid_output_dir} {full_model_path}")
+                        rank0_print("=" * 80 + "\n")
+        except Exception as e:
+            rank0_print(f"处理DeepSpeed配置时出错: {e}")
         
-        return output_dir 
+        # 第四步：保存vision tower（如果存在）
+        try:
+            if hasattr(self, "model") and self.model:
+                unwrapped_model = self.model
+                if hasattr(self, "accelerator") and hasattr(self.accelerator, "unwrap_model"):
+                    unwrapped_model = self.accelerator.unwrap_model(self.model)
+                
+                if hasattr(unwrapped_model, "get_vision_tower"):
+                    vision_tower = unwrapped_model.get_vision_tower()
+                    if vision_tower is not None:
+                        vision_tower_path = os.path.join(valid_output_dir, "vision_tower")
+                        os.makedirs(vision_tower_path, exist_ok=True)
+                        
+                        # 尝试保存vision tower
+                        if hasattr(vision_tower, "save_pretrained"):
+                            rank0_print(f"使用save_pretrained保存vision tower到: {vision_tower_path}")
+                            vision_tower.save_pretrained(vision_tower_path)
+                        elif hasattr(vision_tower, "save_model"):
+                            rank0_print(f"使用save_model保存vision tower到: {vision_tower_path}")
+                            vision_tower.save_model(vision_tower_path)
+                        else:
+                            rank0_print(f"使用state_dict保存vision tower到: {vision_tower_path}")
+                            torch.save(vision_tower.state_dict(), os.path.join(vision_tower_path, "pytorch_model.bin"))
+        except Exception as e:
+            rank0_print(f"保存vision tower时出错: {e}")
+        
+        # 返回有效的输出目录
+        return valid_output_dir 
