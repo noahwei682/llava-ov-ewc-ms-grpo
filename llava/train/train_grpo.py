@@ -575,6 +575,26 @@ def main():
     # Save the final model
     trainer.save_model(training_args.output_dir)
     
+    # Step 5: Ensure model weights are saved
+    try:
+        if hasattr(trainer, "model") and trainer.model:
+            unwrapped_model = trainer.model
+            if hasattr(trainer, "accelerator") and hasattr(trainer.accelerator, "unwrap_model"):
+                unwrapped_model = trainer.accelerator.unwrap_model(trainer.model)
+
+            # Save model weights
+            from safetensors.torch import save_file
+            state_dict = unwrapped_model.state_dict()
+            save_file(state_dict, os.path.join(training_args.output_dir, "model.safetensors"))
+
+            # Save config if available
+            if hasattr(unwrapped_model, "config"):
+                config_path = os.path.join(training_args.output_dir, "config.json")
+                with open(config_path, "w") as f:
+                    json.dump(unwrapped_model.config.to_dict(), f, indent=2)
+    except Exception as e:
+        rank0_print(f"Error saving model weights: {e}")
+
 
 if __name__ == "__main__":
     main() 
