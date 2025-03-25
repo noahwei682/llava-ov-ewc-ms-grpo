@@ -42,6 +42,9 @@ RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 
 def accuracy_reward(completions, solution, **kwargs):
+    # import torch; torch.cuda.empty_cache()     
+    # breakpoint()
+    # import ipdb; ipdb.set_trace()
     """Reward function that checks if the completion is correct using either regex extraction or exact string matching."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
@@ -76,14 +79,23 @@ def accuracy_reward(completions, solution, **kwargs):
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"content: {content}\n")
                 f.write(f"sol: {sol}\n")
-    return rewards
+    # import torch; torch.cuda.empty_cache()  
+    # breakpoint()   
+    # import ipdb; ipdb.set_trace()
+    # return rewards
 
 
 def format_reward(completions, **kwargs):
+    # import torch; torch.cuda.empty_cache() 
+    # breakpoint()    
+    # import ipdb; ipdb.set_trace()
     """Reward function that checks if the completion has the proper format with <think> and <answer> tags."""
     pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+    # import torch; torch.cuda.empty_cache()    
+    # breakpoint() 
+    # import ipdb; ipdb.set_trace()
     return [1.0 if match else 0.0 for match in matches]
 
 
@@ -215,6 +227,9 @@ class GRPOTrainer(Trainer):
         3. Computing KL divergence between current and reference policy
         4. Combining reward maximization with KL regularization
         """
+        # import torch; torch.cuda.empty_cache()    
+        # breakpoint()
+        # import ipdb; ipdb.set_trace()
         # Extract necessary inputs
         input_ids = inputs.get("input_ids")
         attention_mask = inputs.get("attention_mask")
@@ -223,6 +238,9 @@ class GRPOTrainer(Trainer):
         # Get response generation start indices
         response_start_indices = torch.argmax((labels >= 0).int(), dim=1)
         
+        # import torch; torch.cuda.empty_cache()  
+        # breakpoint()   
+        # import ipdb; ipdb.set_trace()
         # Forward pass
         outputs = model(
             input_ids=input_ids,
@@ -230,6 +248,10 @@ class GRPOTrainer(Trainer):
             labels=labels,
             return_dict=True
         )
+        # import torch; torch.cuda.empty_cache()   
+        # breakpoint()  
+        # import ipdb; ipdb.set_trace()
+
         
         # Get log probabilities from the model outputs
         logits = outputs.logits
@@ -283,6 +305,9 @@ class GRPOTrainer(Trainer):
         Compute KL divergence between current and reference policy.
         Only consider tokens that are part of the generated completion (where labels >= 0).
         """
+        # import torch; torch.cuda.empty_cache()   
+        # breakpoint()  
+        # import ipdb; ipdb.set_trace()  
         # Create a mask for tokens that are part of the completion
         completion_mask = (labels >= 0).float()
         
@@ -300,9 +325,14 @@ class GRPOTrainer(Trainer):
         Compute rewards for a batch of completions.
         Aggregates rewards from all reward functions.
         """
+        # import torch; torch.cuda.empty_cache()   
+        # breakpoint()  
+        # import ipdb; ipdb.set_trace()
         total_rewards = None
         
         for reward_func in self.processed_reward_funcs:
+            # import torch; torch.cuda.empty_cache()     
+            # import ipdb; ipdb.set_trace()
             if isinstance(reward_func, PreTrainedModel):
                 # TODO: Implement model-based reward computation
                 pass
@@ -323,6 +353,9 @@ class GRPOTrainer(Trainer):
         
     def generate_completions(self, prompts, solutions):
         """Generate completions for evaluation or reward computation."""
+        # import torch; torch.cuda.empty_cache()  
+        # breakpoint()   
+        # import ipdb; ipdb.set_trace()
         model = unwrap_model(self.model)
         model.eval()
         
@@ -330,9 +363,15 @@ class GRPOTrainer(Trainer):
         for prompt, solution in zip(prompts, solutions):
             # TODO: Implement proper generation logic
             # For now, use a placeholder
+            # import torch; torch.cuda.empty_cache()    
+            # breakpoint() 
+            # import ipdb; ipdb.set_trace()
             completion = [{"role": "assistant", "content": solution}]  # Using solution as placeholder
             completions.append(completion)
             
+        # import torch; torch.cuda.empty_cache()   
+        # breakpoint()      
+        # import ipdb; ipdb.set_trace()
         return completions
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
@@ -357,6 +396,9 @@ class GRPOTrainer(Trainer):
                 total_rewards.extend(batch_rewards)
                 
         if total_rewards:
+            # import torch; torch.cuda.empty_cache()    
+            # breakpoint() 
+            # import ipdb; ipdb.set_trace()
             metrics[f"{metric_key_prefix}_mean_reward"] = sum(total_rewards) / len(total_rewards)
             
         self.log(metrics)
