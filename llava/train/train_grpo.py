@@ -87,7 +87,7 @@ class GRPOConfig(TrainingArguments):
     gen_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {"max_new_tokens": 512, "temperature": 1.0, "top_k": 0, "top_p": 1.0}
     )
-    # LLaVATrainer相关参数
+    # Parameters related to LLaVATrainer
     group_by_modality_length: bool = field(default=False, metadata={"help": "Group training data by modality length for batch creation"})
     group_by_modality_length_auto: bool = field(default=False, metadata={"help": "Automatically group training data by modality length"})
     auto_find_batch_size: bool = field(default=False, metadata={"help": "Automatically find optimal batch size"})
@@ -304,15 +304,16 @@ def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, GRPOConfig))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     
-    # 如果使用DeepSpeed，对Qwen模型禁用某些优化
+        
+    # If using DeepSpeed, disable certain optimizations for the Qwen model
     if 'qwen' in model_args.model_name_or_path.lower() and training_args.deepspeed is not None:
         rank0_print("Detected Qwen model with DeepSpeed - modifying DeepSpeed config to avoid shape errors")
-        # 禁用优化以避免形状不匹配问题
+        # Disable optimizations to avoid shape mismatch issues
         if isinstance(training_args.deepspeed, str) and os.path.exists(training_args.deepspeed):
             import json
             with open(training_args.deepspeed, 'r') as f:
                 ds_config = json.load(f)
-            # 禁用可能导致问题的优化
+            # Disable optimizations that may cause issues
             if "zero_optimization" in ds_config:
                 ds_config["zero_optimization"]["stage3_param_persistence_threshold"] = 1e10
                 if "offload_optimizer" in ds_config["zero_optimization"]:
@@ -323,11 +324,11 @@ def main():
             if "optimizer" in ds_config:
                 ds_config["optimizer"]["params"]["torch_adam"] = True
                 ds_config["optimizer"]["params"]["adam_w_mode"] = False
-            # 写回修改后的配置
+            # Write back the modified configuration
             with open(training_args.deepspeed, 'w') as f:
                 json.dump(ds_config, f, indent=4)
         elif isinstance(training_args.deepspeed, dict):
-            # 如果deepspeed是一个配置字典，直接修改它
+            # If deepspeed is a configuration dictionary, modify it directly
             if "zero_optimization" in training_args.deepspeed:
                 training_args.deepspeed["zero_optimization"]["stage3_param_persistence_threshold"] = 1e10
                 if "offload_optimizer" in training_args.deepspeed["zero_optimization"]:
@@ -336,45 +337,52 @@ def main():
             if "optimizer" in training_args.deepspeed:
                 training_args.deepspeed["optimizer"]["params"]["torch_adam"] = True
                 training_args.deepspeed["optimizer"]["params"]["adam_w_mode"] = False
-    
+
+        
     # Set model peft config if provided
     use_peft = model_args.peft_config and len(model_args.peft_config) > 0
     if use_peft:
         peft_config = LoraConfig(**model_args.peft_config)
     else:
         peft_config = None
-    
-    # 如果GRPOConfig没有显式设置group_by_modality_length，则从data_args获取默认值
+        
+
+
+    # If GRPOConfig has not explicitly set group_by_modality_length, get the default value from data_args
     if hasattr(data_args, 'group_by_modality_length_default'):
         training_args.group_by_modality_length = data_args.group_by_modality_length_default
-        
-    # 使用monkey patching将学习率参数添加到training_args对象
+
+    # Use monkey patching to add learning rate parameters to the training_args object
     if hasattr(model_args, 'mm_projector_lr'):
         training_args.__dict__['mm_projector_lr'] = model_args.mm_projector_lr
-    
+
     if hasattr(model_args, 'mm_vision_tower_lr'):
         training_args.__dict__['mm_vision_tower_lr'] = model_args.mm_vision_tower_lr
-        
+
     if hasattr(model_args, 'vision_tower_lr'):
         training_args.__dict__['vision_tower_lr'] = model_args.vision_tower_lr
-    
-    # 处理model_max_length参数    
+
+    # Handle model_max_length parameter    
     if hasattr(model_args, 'model_max_length') and model_args.model_max_length is not None:
         training_args.__dict__['model_max_length'] = model_args.model_max_length
-        
+
+    ################ grpo ################
     # Set the system prompt
     system_prompt = data_args.system_prompt
-    
+
     # Parse reward functions
     reward_funcs = data_args.reward_funcs.split(",")
     rank0_print(f"Using reward functions: {reward_funcs}")
-    
+    ################ grpo ################
+
     # Set the conversation template based on the model
     template_name = model_args.version
     if template_name not in conv_templates:
         rank0_print(f"Warning: Template {template_name} not found in conv_templates. Using 'v1' as fallback.")
         template_name = "v1"
     rank0_print(f"Using template: {template_name}")
+
+
     
     # Load tokenizer
     try:
@@ -490,6 +498,7 @@ def main():
         rank0_print(f"Error loading dataset: {e}")
         rank0_print("Creating a tiny dummy dataset for testing")
         
+        ################################################################ grpo ################################################################
         # Create a tiny dummy dataset for testing
         dummy_train = {"prompt": ["What is this?"] * 10, "completion": ["This is a test."] * 10, "image": [None] * 10}
         dummy_val = {"prompt": ["Test question?"] * 2, "completion": ["Test answer."] * 2, "image": [None] * 2}
@@ -498,7 +507,9 @@ def main():
             "train": Dataset.from_dict(dummy_train),
             "validation": Dataset.from_dict(dummy_val)
         }
-    
+        ################################################################ grpo ################################################################
+
+
     # Split dataset if it has 'train' and 'validation' splits
     if isinstance(dataset, dict):
         # Dataset is already a dictionary with splits
@@ -547,11 +558,11 @@ def main():
     rank0_print(f"Train dataset size: {len(train_dataset)}")
     rank0_print(f"Eval dataset size: {len(eval_dataset)}")
     
-    # 为数据集添加模态长度属性
+    # Add modality length attribute to the dataset
     def add_modality_length(dataset):
         lengths = []
         for example in dataset:
-            # 正值表示多模态（有图像），负值表示纯文本
+            # Positive value indicates multimodal (with image), negative value indicates pure text
             if example.get("image") is not None:
                 lengths.append(len(example["input_ids"]))
             else:
@@ -559,8 +570,8 @@ def main():
                 
         dataset.modality_lengths = lengths
         return dataset
-    
-    # 为训练和评估数据集添加模态长度
+
+    # Add modality length to the training and evaluation datasets
     if training_args.group_by_modality_length or training_args.group_by_modality_length_auto:
         train_dataset = add_modality_length(train_dataset)
         
@@ -576,7 +587,10 @@ def main():
         data_args=data_args,
         model_args=model_args
     )
-    
+
+    # breakpoint()
+    # import ipdb; ipdb.set_trace()
+    # import pdb; pdb.set_trace()      
     # Start training
     trainer.train()
     
@@ -610,4 +624,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # breakpoint()
+    # import ipdb; ipdb.set_trace()   
     main() 
