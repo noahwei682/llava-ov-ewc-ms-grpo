@@ -22,7 +22,6 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
-# import ipdb; ipdb.set_trace()
 import PIL
 from PIL import Image, ImageFile
 from packaging import version
